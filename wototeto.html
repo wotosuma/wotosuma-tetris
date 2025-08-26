@@ -1,0 +1,601 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>をとすまテトリス AI</title>
+<style>
+  :root { --bg:#0f1226; --grid:#1b1f3a; --cell:#2a2f57; --ghost:#424874; --text:#f5f7ff; }
+  body{margin:0; background:var(--bg); color:var(--text); font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Hiragino Kaku Gothic ProN", Meiryo, sans-serif; display:grid; place-items:center; height:100vh}
+  .wrap{display:flex; gap:24px; align-items:flex-start}
+  canvas{background:linear-gradient(180deg,#111531,#0f132b); box-shadow:0 10px 30px rgba(0,0,0,.4); border-radius:12px}
+  .panel{min-width:220px}
+  h1{margin:.2em 0 .4em; font-size:20px; letter-spacing:.04em}
+  .stat{display:grid; grid-template-columns:auto 1fr; gap:6px 10px; align-items:center; font-size:14px}
+  .key{display:inline-block; border:1px solid #666; border-bottom-width:3px; padding:2px 6px; border-radius:6px; font-size:12px; margin-right:6px}
+  .btn{margin-top:12px; background:#394176; color:#fff; border:0; padding:10px 14px; border-radius:8px; cursor:pointer}
+  .legend{font-size:12px; opacity:.85; line-height:1.6}
+  a{color:#cdd6ff}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <canvas id="game" width="360" height="720" aria-label="をとすまテトリス"></canvas>
+    <div class="panel">
+      <h1>をとすまテトリス 回転修正版</h1>
+      <div class="stat">
+        <div>スコア</div><div id="score">0</div>
+        <div>レベル</div><div id="level">1</div>
+        <div>消去ライン</div><div id="lines">0</div>
+        <div>次のピース</div><div><canvas id="next" width="120" height="120"></canvas></div>
+        <div>ホールド</div><div><canvas id="hold" width="120" height="120"></canvas></div>
+      </div>
+      <button class="btn" id="restart">リスタート (R)</button>
+      <p class="legend">
+        <span class="key">← →</span>移動
+        <span class="key">↑</span>回転
+        <span class="key">↓</span>落下
+        <span class="key">Space</span>ハードドロップ<br>
+        <span class="key">P</span>一時停止
+        <span class="key">C</span>ホールド
+      </p>
+    </div>
+  </div>
+
+<script>
+(() => {
+  // Basic settings
+  const COLS = 10, ROWS = 20, CELL = 36;
+  const FALL_BASE_MS = 900;
+  const LETTERS = ['を','と','す','ま'];
+  const AI_STEP_MS = 100;
+
+  // Tetromino definitions (rotation matrices are generated as needed)
+  const SHAPES = {
+    I: [[1,1,1,1]],
+    O: [[1,1],[1,1]],
+    T: [[1,1,1],[0,1,0]],
+    S: [[0,1,1],[1,1,0]],
+    Z: [[1,1,0],[0,1,1]],
+    J: [[1,0,0],[1,1,1]],
+    L: [[0,0,1],[1,1,1]]
+  };
+  const COLORS = {
+    I:'#4ec5ff', O:'#ffd166', T:'#c77dff', S:'#95d08b',
+    Z:'#ff6b6b', J:'#6aa2ff', L:'#ffad66'
+  };
+
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const nextCanvas = document.getElementById('next');
+  const nctx = nextCanvas.getContext('2d');
+  const holdCanvas = document.getElementById('hold');
+  const hctx = holdCanvas.getContext('2d');
+  const scoreEl = document.getElementById('score');
+  const levelEl = document.getElementById('level');
+  const linesEl = document.getElementById('lines');
+
+  // Board state
+  let board = createMatrix(COLS, ROWS, null);
+
+  // Game state
+  let bag = [];
+  let current = null;
+  let nextPiece = randomPiece();
+  let holdPiece = null;
+  let canHold = true;
+  let score = 0, lines = 0, level = 1;
+  let dropCounter = 0, lastTime = 0;
+  let paused = false;
+  let rafId = null;
+  let isAiPlaying = false;
+  let aiIntervalId = null;
+
+  // AI logic and actions
+  function aiThinkAndMove() {
+    if (paused || !current) return;
+
+    // Compare the best move without holding vs. with holding
+    let bestMove = findBestMoveForPiece(clone(current), clone(board), false);
+    
+    if (canHold && holdPiece) {
+      const bestHoldMove = findBestMoveForPiece(clone(holdPiece), clone(board), true);
+      if (bestHoldMove.score > bestMove.score) {
+        bestMove = bestHoldMove;
+      }
+    }
+    
+    // Execute the AI's actions
+    if (bestMove) {
+      if (bestMove.useHold) {
+        hold();
+        bestMove = findBestMoveForPiece(clone(current), clone(board), false);
+      }
+
+      for (let i = 0; i < bestMove.rotation; i++) {
+        rotateCurrent(1);
+      }
+
+      const moveDirection = bestMove.x - current.x;
+      for (let i = 0; i < Math.abs(moveDirection); i++) {
+        move(Math.sign(moveDirection));
+      }
+
+      hardDrop();
+    }
+  }
+
+  // Find the best move for a specific piece
+  function findBestMoveForPiece(piece, boardState, useHold) {
+    let bestScore = -Infinity;
+    let bestMove = null;
+    
+    const possibleMoves = [];
+
+    findPossibleMovesForPiece(piece, boardState, useHold, possibleMoves);
+    
+    for (const move of possibleMoves) {
+      const { finalBoard, finalHeight, clearedLines, holes, bumpiness } = getPlacementStats(move.piece, move.board);
+      
+      const score = 
+        clearedLines * 1000 - 
+        finalHeight * 10 - 
+        holes * 50 - 
+        bumpiness * 5; 
+      
+      if (score > bestScore) {
+        bestScore = score;
+        bestMove = move;
+        bestMove.score = score;
+      }
+    }
+    
+    return bestMove;
+  }
+
+  // Try all possible rotations and positions for a piece
+  function findPossibleMovesForPiece(piece, boardState, useHold, possibleMoves) {
+    const originalPiece = clone(piece);
+
+    for (let rotation = 0; rotation < 4; rotation++) {
+      const rotatedPiece = clone(originalPiece);
+      for (let i = 0; i < rotation; i++) {
+        rotatedPiece.matrix = rotate(rotatedPiece.matrix);
+        rotatedPiece.letters = rotate(rotatedPiece.letters);
+      }
+
+      for (let x = -rotatedPiece.matrix.length; x < COLS; x++) {
+        const testPiece = clone(rotatedPiece);
+        testPiece.x = x;
+        testPiece.y = 0;
+        
+        if (collide(testPiece, boardState, testPiece.x, testPiece.y)) {
+          continue; 
+        }
+
+        let dropY = testPiece.y;
+        while (!collide(testPiece, boardState, testPiece.x, dropY + 1)) {
+          dropY++;
+        }
+        testPiece.y = dropY;
+
+        if (!collide(testPiece, boardState, testPiece.x, testPiece.y)) {
+          possibleMoves.push({
+            piece: testPiece,
+            board: boardState,
+            rotation,
+            x,
+            useHold
+          });
+        }
+      }
+    }
+  }
+
+  // Evaluate the board after placing a piece
+  function getPlacementStats(piece, boardState) {
+    const finalBoard = clone(boardState);
+    const { matrix, x, y, type } = piece;
+    
+    for (let py = 0; py < matrix.length; py++) {
+      for (let px = 0; px < matrix[py].length; px++) {
+        if (matrix[py][px]) {
+          finalBoard[y + py][x + px] = { type };
+        }
+      }
+    }
+    
+    let clearedLines = 0;
+    for (let row = ROWS - 1; row >= 0; row--) {
+      if (finalBoard[row].every(cell => cell !== null)) {
+        clearedLines++;
+      }
+    }
+    
+    let finalHeight = 0;
+    for (let y = 0; y < ROWS; y++) {
+      for (let x = 0; x < COLS; x++) {
+        if (finalBoard[y][x] !== null) {
+          finalHeight = ROWS - y;
+          break;
+        }
+      }
+      if (finalHeight > 0) break;
+    }
+    
+    let holes = 0;
+    for (let x = 0; x < COLS; x++) {
+      let foundBlock = false;
+      for (let y = 0; y < ROWS; y++) {
+        if (finalBoard[y][x] !== null) {
+          foundBlock = true;
+        } else if (foundBlock) {
+          holes++;
+        }
+      }
+    }
+    
+    let bumpiness = 0;
+    const heights = Array(COLS).fill(0);
+    for (let x = 0; x < COLS; x++) {
+      for (let y = 0; y < ROWS; y++) {
+        if (finalBoard[y][x] !== null) {
+          heights[x] = ROWS - y;
+          break;
+        }
+      }
+    }
+    for (let i = 0; i < COLS - 1; i++) {
+      bumpiness += Math.abs(heights[i] - heights[i+1]);
+    }
+    
+    return { finalBoard, finalHeight, clearedLines, holes, bumpiness };
+  }
+
+  // Helper functions
+  function createMatrix(w,h,fill=null){
+    return Array.from({length:h},()=>Array(w).fill(fill));
+  }
+  function clone(o){ return JSON.parse(JSON.stringify(o)); }
+  function rnd(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
+  function makeLetters(shape){
+    return shape.map(row=>row.map(v=>v? rnd(LETTERS): null));
+  }
+  
+  /**
+   * Rotates a matrix 90 degrees clockwise.
+   * @param {Array<Array<any>>} matrix The matrix to rotate.
+   * @returns {Array<Array<any>>} The rotated matrix.
+   */
+  function rotate(matrix) {
+    const rows = matrix.length;
+    const cols = matrix[0].length;
+    const newMatrix = createMatrix(rows, cols);
+
+    for (let y = 0; y < rows; y++) {
+      for (let x = 0; x < cols; x++) {
+        newMatrix[x][rows - 1 - y] = matrix[y][x];
+      }
+    }
+    return newMatrix;
+  }
+
+  function newFromBag(){
+    if(bag.length===0){
+      bag = Object.keys(SHAPES);
+      for(let i=bag.length-1;i>0;i--){
+        const j = (Math.random()* (i+1))|0;
+        [bag[i], bag[j]] = [bag[j], bag[i]];
+      }
+    }
+    const type = bag.pop();
+    const shape = SHAPES[type];
+    return {
+      type,
+      matrix: shape.map(r=>r.slice()),
+      letters: makeLetters(shape),
+      x: ((COLS/2)|0) - ((shape[0].length/2)|0),
+      y: -shape.length
+    };
+  }
+  function randomPiece(){
+    return newFromBag();
+  }
+
+  function spawn(){
+    current = nextPiece;
+    nextPiece = newFromBag();
+    canHold = true;
+    if(collide(current, board, current.x, current.y+1)) {
+      gameOver();
+    }
+    drawNext();
+    drawHold();
+  }
+
+  function collide(piece, brd, px, py){
+    const {matrix} = piece;
+    for(let y=0;y<matrix.length;y++){
+      for(let x=0;x<matrix[y].length;x++){
+        if(!matrix[y][x]) continue;
+        const nx = px + x, ny = py + y;
+        if(ny<0) continue;
+        if(nx<0 || nx>=COLS || ny>=ROWS) return true;
+        if(brd[ny][nx]) return true;
+      }
+    }
+    return false;
+  }
+
+  function merge(piece){
+    const {matrix, letters, x:px, y:py, type} = piece;
+    for(let y=0;y<matrix.length;y++){
+      for(let x=0;x<matrix[y].length;x++){
+        if(!matrix[y][x]) continue;
+        const nx = px + x, ny = py + y;
+        if(ny<0) continue;
+        board[ny][nx] = { type, ch: letters[y][x] || rnd(LETTERS) };
+      }
+    }
+  }
+
+  function sweep(){
+    let cleared = 0;
+    outer: for(let y=ROWS-1; y>=0; y--){
+      for(let x=0; x<COLS; x++){
+        if(!board[y][x]) continue outer;
+      }
+      const row = board.splice(y,1)[0];
+      board.unshift(Array(COLS).fill(null));
+      cleared++;
+      y++;
+    }
+    if(cleared>0){
+      const table = [0,100,300,500,800]; 
+      score += table[cleared] * level;
+      lines += cleared;
+      level = 1 + Math.floor(lines/10);
+      updateHUD();
+    }
+  }
+
+  function drop(){
+    if(!current) return;
+    const ny = current.y + 1;
+    if(!collide(current, board, current.x, ny)){
+      current.y = ny;
+    } else {
+      merge(current);
+      sweep();
+      spawn();
+    }
+  }
+
+  function hardDrop(){
+    if(!current) return;
+    let dist = 0;
+    while(!collide(current, board, current.x, current.y+1)){
+      current.y++;
+      dist++;
+    }
+    score += 2*dist;
+    merge(current);
+    sweep();
+    spawn();
+    updateHUD();
+  }
+
+  function move(dir){
+    if(!current) return;
+    const nx = current.x + dir;
+    if(!collide(current, board, nx, current.y)){
+      current.x = nx;
+    }
+  }
+
+  function rotateCurrent(dir=1){
+    if(!current) return;
+    const oldM = current.matrix;
+    const oldL = current.letters;
+    const m = rotate(oldM);
+    const l = rotate(oldL);
+    
+    const kickCandidates = [0, -1, 1, -2, 2];
+    for(const dx of kickCandidates){
+      if(!collide({...current, matrix:m}, board, current.x+dx, current.y)){
+        current.matrix = m;
+        current.letters = l;
+        current.x += dx;
+        return;
+      }
+    }
+  }
+
+  function hold(){
+    if(!canHold || !current) return;
+    if(!holdPiece){
+      holdPiece = {...current, x:0, y:0};
+      spawn();
+    } else {
+      const tmp = holdPiece;
+      holdPiece = {...current, x:0, y:0};
+      current = tmp;
+      current.x = ((COLS/2)|0) - ((current.matrix[0].length/2)|0);
+      current.y = -current.matrix.length;
+    }
+    canHold = false;
+    drawHold();
+  }
+
+  function updateHUD(){
+    scoreEl.textContent = score;
+    levelEl.textContent = level;
+    linesEl.textContent = lines;
+  }
+
+  // Drawing
+  function drawCell(g, x,y, size, color, ch, ghost=false){
+    g.fillStyle = ghost ? 'rgba(255,255,255,0.10)' : color;
+    g.fillRect(x, y, size, size);
+    g.fillStyle = 'rgba(0,0,0,0.18)';
+    g.fillRect(x, y+size-5, size, 5);
+    if(ch){
+      g.fillStyle = ghost ? 'rgba(255,255,255,0.45)' : '#ffffff';
+      g.font = `${Math.floor(size*0.7)}px "Hiragino Kaku Gothic ProN", Meiryo, system-ui`;
+      g.textAlign = 'center';
+      g.textBaseline = 'middle';
+      g.fillText(ch, x+size/2, y+size/2+1);
+    }
+  }
+
+  function drawBoard(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    for(let y=0; y<ROWS; y++){
+      for(let x=0; x<COLS; x++){
+        ctx.fillStyle = (x+y)%2? '#171b3a' : '#131735';
+        ctx.fillRect(x*CELL, y*CELL, CELL, CELL);
+        ctx.strokeStyle = '#1c2147';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x*CELL+.5, y*CELL+.5, CELL-1, CELL-1);
+        const cell = board[y][x];
+        if(cell){
+          drawCell(ctx, x*CELL+1, y*CELL+1, CELL-2, COLORS[cell.type], cell.ch);
+        }
+      }
+    }
+  }
+
+  function ghostY(){
+    if(!current) return 0;
+    let y = current.y;
+    while(!collide(current, board, current.x, y+1)) y++;
+    return y;
+  }
+
+  function drawPiece(g, piece, offsetX, offsetY, cell=CELL, ghost=false){
+    const {matrix, letters, type} = piece;
+    for(let y=0;y<matrix.length;y++){
+      for(let x=0;x<matrix[y].length;x++){
+        if(!matrix[y][x]) continue;
+        const px = (offsetX + x) * cell;
+        const py = (offsetY + y) * cell;
+        drawCell(g, px+1, py+1, cell-2, COLORS[type], letters[y][x], ghost);
+      }
+    }
+  }
+
+  function drawNext(){
+    nctx.clearRect(0,0,nextCanvas.width,nextCanvas.height);
+    const cell = 24;
+    const offX = 2, offY = 2;
+    drawPiece(nctx, normalizeForPreview(nextPiece), offX, offY, cell);
+  }
+
+  function drawHold(){
+    hctx.clearRect(0,0,holdCanvas.width,holdCanvas.height);
+    if(!holdPiece) return;
+    const cell = 24;
+    const offX = 2, offY = 2;
+    drawPiece(hctx, normalizeForPreview(holdPiece), offX, offY, cell);
+  }
+
+  function normalizeForPreview(p){
+    const cp = clone(p);
+    return cp;
+  }
+
+  function gameOver(){
+    paused = true;
+    if (aiIntervalId) {
+      clearInterval(aiIntervalId);
+    }
+    cancelAnimationFrame(rafId);
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
+    ctx.fillRect(0,0,canvas.width,canvas.height);
+    ctx.fillStyle = '#fff';
+    ctx.font = '28px system-ui, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('ゲームオーバー', canvas.width/2, canvas.height/2 - 10);
+    ctx.font = '16px system-ui, sans-serif';
+    ctx.fillText('Rでリスタート', canvas.width/2, canvas.height/2 + 20);
+  }
+
+  // Game loop
+  function update(t=0){
+    if(paused){ return; }
+    const dt = t - lastTime;
+    lastTime = t;
+    const speed = Math.max(120, FALL_BASE_MS - (level-1)*70);
+    dropCounter += dt;
+    if(dropCounter > speed){
+      drop();
+      dropCounter = 0;
+    }
+    drawBoard();
+
+    if(current){
+      const gy = ghostY();
+      drawPiece(ctx, {...current, y:gy}, 0, 0, CELL, true);
+      drawPiece(ctx, current, current.x, current.y, CELL);
+    }
+
+    rafId = requestAnimationFrame(update);
+  }
+
+  // User input
+  document.addEventListener('keydown', e=>{
+    if(e.repeat) return;
+    
+    // AI toggle on 'A' key press
+    if (e.code === 'KeyA') {
+      isAiPlaying = !isAiPlaying;
+      if (isAiPlaying) {
+        aiIntervalId = setInterval(aiThinkAndMove, AI_STEP_MS);
+      } else {
+        clearInterval(aiIntervalId);
+      }
+      return;
+    }
+
+    if (isAiPlaying) return;
+
+    switch(e.code){
+      case 'ArrowLeft': move(-1); break;
+      case 'ArrowRight': move(1); break;
+      case 'ArrowDown': drop(); score++; updateHUD(); break;
+      case 'ArrowUp': rotateCurrent(1); break;
+      case 'Space': e.preventDefault(); hardDrop(); break;
+      case 'KeyP': paused = !paused; if(!paused){ lastTime=performance.now(); update(lastTime);} break;
+      case 'KeyR': restart(); break;
+      case 'KeyC': hold(); break;
+    }
+  });
+  document.getElementById('restart').addEventListener('click', restart);
+
+  function restart(){
+    board = createMatrix(COLS, ROWS, null);
+    bag = [];
+    score = 0; lines = 0; level = 1;
+    paused = false; dropCounter = 0; lastTime = 0;
+    nextPiece = newFromBag();
+    holdPiece = null; canHold = true;
+    spawn();
+    updateHUD();
+    cancelAnimationFrame(rafId);
+    if (aiIntervalId) {
+      clearInterval(aiIntervalId);
+    }
+    isAiPlaying = false;
+    update();
+  }
+
+  // Initialization
+  (function init(){
+    updateHUD();
+    spawn();
+    update();
+  })();
+})();
+</script>
+</body>
+</html>
